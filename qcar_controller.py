@@ -21,7 +21,7 @@ from tkinter import ttk, messagebox
 
 try:
     from bleak import BleakClient, BleakScanner
-    from Crypto.Cipher import AES
+    import qcar.protocol as protocol
 except ImportError as exc:
     raise SystemExit(
         "Missing dependency. Run setup.bat first.\n"
@@ -32,23 +32,6 @@ except ImportError as exc:
 __version__ = "0.1.0"
 APP_NAME = "QCar Controller"
 
-
-SERVICE_UUID = "0000fff0-0000-1000-8000-00805f9b34fb"
-WRITE_UUID = "d44bc439-abfd-45a2-b575-925416129600"
-NOTIFY_UUID = "d44bc439-abfd-45a2-b575-925416129601"
-
-AES_KEY = bytes.fromhex("34522a5b7a6e492c08090a9d8d2a23f8")
-
-# Packet layout tested with our micro-USB and USB-C battery revisions:
-# [0] unknown/0
-# [1:4] b"CTL"
-# [4] forward
-# [5] reverse
-# [6] left
-# [7] right
-# [8] lights: 0=on, 1=off
-# [9] speed/power: 0x50 normal, 0x64 turbo
-# [10:16] zero padding
 
 SEND_INTERVAL = 0.05  # 50 ms; responsive without hammering Windows BLE
 
@@ -130,7 +113,7 @@ class BleWorker:
                 raise RuntimeError("Windows reported that the BLE connection was not established.")
 
             try:
-                await self.client.start_notify(NOTIFY_UUID, self._battery_notification)
+                await self.client.start_notify(protocol.NOTIFY_UUID, self._battery_notification)
             except Exception as exc:
                 # Driving can still work even if notifications are unavailable.
                 self.post("status", f"Connected. Battery readout unavailable: {exc}")
@@ -172,7 +155,7 @@ class BleWorker:
                         pass
 
                     try:
-                        await self.client.stop_notify(NOTIFY_UUID)
+                        await self.client.stop_notify(protocol.NOTIFY_UUID)
                     except Exception:
                         pass
 
@@ -192,11 +175,9 @@ class BleWorker:
 
     def _battery_notification(self, _sender, data: bytearray):
         try:
-            if len(data) != 16:
-                return
-            plain = AES.new(AES_KEY, AES.MODE_ECB).decrypt(bytes(data))
-            if plain[1:4] == b"VBT":
-                self.post("battery", int(plain[4]))
+            battery = protocol.decode_battery_notification(bytes(data))
+            if battery is not None:
+                self.post("battery", battery)
         except Exception:
             pass
 
@@ -238,18 +219,17 @@ class BleWorker:
             right = False if force_stop else self.right
             turbo = False if force_stop else self.turbo
             lights = self.lights
-            speed = 0x64 if turbo else self.normal_speed
+            normal_speed = self.normal_speed
 
-        cmd = bytearray(16)
-        cmd[1:4] = b"CTL"
-        cmd[4] = 1 if forward else 0
-        cmd[5] = 1 if reverse else 0
-        cmd[6] = 1 if left else 0
-        cmd[7] = 1 if right else 0
-        cmd[8] = 0 if lights else 1
-        cmd[9] = speed
-
-        return AES.new(AES_KEY, AES.MODE_ECB).encrypt(bytes(cmd))
+        return protocol.encode_control_packet(
+            forward=forward,
+            reverse=reverse,
+            left=left,
+            right=right,
+            turbo=turbo,
+            lights=lights,
+            normal_speed=normal_speed,
+        )
 
     async def _write_current(self, force_stop=False):
         if not self.client or not self.client.is_connected:
@@ -257,7 +237,7 @@ class BleWorker:
         packet = self._make_packet(force_stop=force_stop)
         # Let Bleak choose write-with-response vs write-without-response
         # from the characteristic properties; this is safer across Windows BLE stacks.
-        await self.client.write_gatt_char(WRITE_UUID, packet)
+        await self.client.write_gatt_char(protocol.WRITE_UUID, packet)
 
     async def _control_loop(self):
         try:
